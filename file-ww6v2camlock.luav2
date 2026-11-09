@@ -1,0 +1,438 @@
+--[[
+    Prensado Camlock — v2 (objetivo fijo, menú abatible)
+    Activar/desactivar: CONFIG.KEY (por defecto F)
+    Panel: botón MENU / tecla INSERT
+    Re-enganchar objetivo: botón RE-LOCK
+    Cerrar todo: CONFIG.UNLOAD_KEY (por defecto DELETE)
+]]
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+
+local LP = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+-- ===================== CONFIG =====================
+local CONFIG = {
+    KEY         = Enum.KeyCode.F,
+    UNLOAD_KEY  = Enum.KeyCode.Delete,
+    PANEL_KEY   = Enum.KeyCode.Insert,
+
+    AIM_PART    = "Head",              -- "Head" | "Torso" | "Random" | "Closest"
+    MODE        = "Smooth",            -- "Smooth" | "Snap" | "Silent"
+    FOV         = 220,                 -- radio de ENGANCHE en píxeles
+    SMOOTHNESS  = 0.55,                -- 1 = instantáneo, 0.05 = muy suave
+    PREDICTION  = 0.10,                -- 0 = sin predicción
+    MAX_DISTANCE= 2000,
+
+    TEAM_CHECK  = true,
+    WALL_CHECK  = false,
+    SHOW_FOV    = true,
+    AUTO_ENABLE = false,
+    MOBILE_BUTTON = true,
+
+    STICKY      = true,                -- mantiene el objetivo aunque salga del FOV
+    SNAP_ON_LOCK= true,                -- snap instantáneo al enganchar
+    REACQUIRE   = true,                -- engancha otro si el objetivo muere
+}
+-- ==================================================
+
+local enabled   = CONFIG.AUTO_ENABLE
+local unloaded  = false
+local locked    = nil
+local needRelock = true
+
+local function isAlive(plr)
+    local char = plr and plr.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    return (hum and hum.Health > 0) and true or false
+end
+
+local function getPart(char)
+    if not char then return nil end
+    local name = CONFIG.AIM_PART
+    if name == "Torso" then name = "HumanoidRootPart" end
+    if name == "Random" then
+        name = (math.random() < 0.5) and "Head" or "HumanoidRootPart"
+    end
+    if name ~= "Closest" then
+        return char:FindFirstChild(name) or char:FindFirstChild("HumanoidRootPart")
+    end
+    local best, bestD
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("BasePart") then
+            local d = (v.Position - Camera.CFrame.Position).Magnitude
+            if not bestD or d < bestD then best, bestD = v, d end
+        end
+    end
+    return best
+end
+
+local function findTarget()
+    local best, bestScore
+    local center = Camera.ViewportSize / 2
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LP then
+            local char = plr.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local ok = true
+                if CONFIG.TEAM_CHECK and LP.Team and plr.Team == LP.Team then ok = false end
+
+                if ok then
+                    local part = getPart(char)
+                    if part then
+                        local worldPos = part.Position + part.AssemblyLinearVelocity * CONFIG.PREDICTION
+                        local sp, onScreen = Camera:WorldToViewportPoint(worldPos)
+                        if onScreen and sp.Z > 0 then
+                            local off = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+                            if off <= CONFIG.FOV / 2 then
+                                if CONFIG.WALL_CHECK then
+                                    local rp = RaycastParams.new()
+                                    rp.FilterType = Enum.RaycastFilterType.Exclude
+                                    rp.FilterDescendantsInstances = { LP.Character, char }
+                                    local hit = Workspace:Raycast(Camera.CFrame.Position,
+                                        worldPos - Camera.CFrame.Position, rp)
+                                    if hit then ok = false end
+                                end
+                                if ok then
+                                    local dist = (part.Position - Camera.CFrame.Position).Magnitude
+                                    if dist <= CONFIG.MAX_DISTANCE then
+                                        local score = off + dist * 0.05
+                                        if not bestScore or score < bestScore then
+                                            best, bestScore = plr, score
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local circle = Drawing.new("Circle")
+circle.Thickness = 1.5
+circle.NumSides   = 64
+circle.Filled     = false
+circle.Color      = Color3.fromRGB(0, 255, 140)
+circle.Transparency = 0.65
+
+local function snapTo(plr)
+    local char = plr and plr.Character
+    local part = char and getPart(char)
+    if not part then return end
+    Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, part.Position)
+end
+
+local function acquire()
+    local t = findTarget()
+    if not t then return end
+    locked = t
+    if CONFIG.SNAP_ON_LOCK then snapTo(t) end
+end
+
+RunService:BindToRenderStep("PrensadoCamlock",
+    Enum.RenderPriority.Camera.Value + 1, function()
+    if unloaded then return end
+    Camera = Workspace.CurrentCamera
+
+    circle.Position   = Camera.ViewportSize / 2
+    circle.Radius     = CONFIG.FOV / 2
+    circle.Visible    = CONFIG.SHOW_FOV and enabled
+    circle.Color      = locked and Color3.fromRGB(0, 255, 140)
+                     or (enabled and Color3.fromRGB(255, 200, 60)
+                                  or Color3.fromRGB(120, 120, 130))
+
+    if not enabled then return end
+
+    -- objetivo muerto / fuera
+    if locked then
+        local char = locked.Character
+        local part = char and getPart(char)
+        if not isAlive(locked) or not part then
+            locked = nil
+            needRelock = CONFIG.REACQUIRE
+        end
+    end
+
+    -- solo engancha cuando no hay objetivo, nunca cambia mientras haya uno
+    if needRelock and not locked then
+        acquire()
+        if locked then needRelock = false end
+    end
+
+    if not locked then return end
+
+    local char = locked.Character
+    local part = char and getPart(char)
+    if not part then return end
+
+    -- si STICKY está apagado y se sale del FOV, suelta
+    if not CONFIG.STICKY then
+        local sp, onScreen = Camera:WorldToViewportPoint(part.Position)
+        local center = Camera.ViewportSize / 2
+        if not onScreen or sp.Z <= 0
+        or (Vector2.new(sp.X, sp.Y) - center).Magnitude > CONFIG.FOV / 2 then
+            locked = nil
+            needRelock = true
+            return
+        end
+    end
+
+    local goal = part.Position + part.AssemblyLinearVelocity * CONFIG.PREDICTION
+    local goalCF = CFrame.lookAt(Camera.CFrame.Position, goal)
+
+    if CONFIG.MODE == "Silent" or CONFIG.MODE == "Snap" then
+        Camera.CFrame = goalCF
+    else
+        Camera.CFrame = Camera.CFrame:Lerp(goalCF, CONFIG.SMOOTHNESS)
+    end
+end)
+
+-- ---------- GUI ----------
+local gui = Instance.new("ScreenGui")
+gui.Name = "PrensadoUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = game:GetService("CoreGui")
+
+local function mkBtn(parent, text, w, h, x, y)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(w, h)
+    b.Position = UDim2.fromOffset(x, y)
+    b.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    b.TextColor3 = Color3.fromRGB(232, 232, 238)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 12
+    b.Text = text
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = true
+    b.Parent = parent
+    local c = Instance.new("UICorner", b); c.CornerRadius = UDim.new(0, 6)
+    return b
+end
+
+local panel = Instance.new("Frame")
+panel.Size = UDim2.fromOffset(228, 352)
+panel.Position = UDim2.fromOffset(30, 110)
+panel.BackgroundColor3 = Color3.fromRGB(18, 18, 21)
+panel.BorderSizePixel = 0
+panel.Active = true
+panel.Parent = gui
+local pc = Instance.new("UICorner", panel); pc.CornerRadius = UDim.new(0, 10)
+local ps = Instance.new("UIStroke", panel)
+ps.Color = Color3.fromRGB(60, 60, 68); ps.Thickness = 1
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 32)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "  PRENSADO CAMLOCK"
+title.Parent = panel
+
+local closeBtn = mkBtn(panel, "X", 24, 24, 194, 4)
+closeBtn.MouseButton1Click:Connect(function() panel.Visible = false end)
+
+local toggleBtn = mkBtn(panel, "DESACTIVADO  [" .. CONFIG.KEY.Name .. "]", 200, 30, 14, 36)
+toggleBtn.TextSize = 13
+toggleBtn.BackgroundColor3 = Color3.fromRGB(52, 34, 34)
+
+local function refreshToggle()
+    toggleBtn.Text = (enabled and "ACTIVADO  [" or "DESACTIVADO  [") .. CONFIG.KEY.Name .. "]"
+    toggleBtn.BackgroundColor3 = enabled and Color3.fromRGB(24, 74, 48)
+                                        or Color3.fromRGB(52, 34, 34)
+end
+
+local function setEnabled(v)
+    enabled = v
+    locked = nil
+    needRelock = v
+    refreshToggle()
+end
+
+toggleBtn.MouseButton1Click:Connect(function() setEnabled(not enabled) end)
+
+local relockBtn = mkBtn(panel, "RE-LOCK (cambiar objetivo)", 200, 24, 14, 70)
+relockBtn.MouseButton1Click:Connect(function()
+    if enabled then
+        locked = nil
+        needRelock = true
+    end
+end)
+
+local partRow = { "Head", "Torso", "Random", "Closest" }
+local partBtns = {}
+for i, name in ipairs(partRow) do
+    local b = mkBtn(panel, name, 47, 24, 14 + (i - 1) * 50, 102)
+    partBtns[name] = b
+    b.MouseButton1Click:Connect(function()
+        CONFIG.AIM_PART = name
+        for n, bb in pairs(partBtns) do
+            bb.BackgroundColor3 = (n == name) and Color3.fromRGB(24, 74, 48)
+                                               or Color3.fromRGB(30, 30, 34)
+        end
+    end)
+end
+
+local modeRow = { "Smooth", "Snap", "Silent" }
+local modeBtns = {}
+for i, name in ipairs(modeRow) do
+    local b = mkBtn(panel, name, 64, 24, 14 + (i - 1) * 68, 132)
+    modeBtns[name] = b
+    b.MouseButton1Click:Connect(function()
+        CONFIG.MODE = name
+        for n, bb in pairs(modeBtns) do
+            bb.BackgroundColor3 = (n == name) and Color3.fromRGB(24, 74, 48)
+                                               or Color3.fromRGB(30, 30, 34)
+        end
+    end)
+end
+
+local function mkStepper(label, y, get, set, step, min, max)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.fromOffset(100, 24)
+    l.Position = UDim2.fromOffset(14, y)
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 12
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextColor3 = Color3.fromRGB(190, 190, 200)
+    l.Text = label
+    l.Parent = panel
+
+    local minus = mkBtn(panel, "-", 26, 24, 122, y)
+    local val = Instance.new("TextLabel")
+    val.Size = UDim2.fromOffset(56, 24)
+    val.Position = UDim2.fromOffset(152, y)
+    val.BackgroundColor3 = Color3.fromRGB(30, 30, 34)
+    val.Font = Enum.Font.GothamMedium
+    val.TextSize = 12
+    val.TextColor3 = Color3.fromRGB(240, 240, 245)
+    val.Text = tostring(get())
+    val.Parent = panel
+    local vc = Instance.new("UICorner", val); vc.CornerRadius = UDim.new(0, 6)
+    local plus = mkBtn(panel, "+", 26, 24, 186, y)
+
+    local function upd() val.Text = string.format("%.2f", get()) end
+    minus.MouseButton1Click:Connect(function()
+        set(math.max(min, get() - step)); upd()
+    end)
+    plus.MouseButton1Click:Connect(function()
+        set(math.min(max, get() + step)); upd()
+    end)
+    return upd
+end
+
+mkStepper("FOV (px)", 166,
+    function() return CONFIG.FOV end,
+    function(v) CONFIG.FOV = v end, 25, 50, 900)
+mkStepper("Suavizado", 196,
+    function() return CONFIG.SMOOTHNESS end,
+    function(v) CONFIG.SMOOTHNESS = v end, 0.05, 0.05, 1)
+mkStepper("Predicción", 226,
+    function() return CONFIG.PREDICTION end,
+    function(v) CONFIG.PREDICTION = v end, 0.02, 0, 1)
+
+local function mkCheck(label, y, get, set)
+    local b = mkBtn(panel, label, 200, 24, 14, y)
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    b.Text = "  " .. label
+    local function paint()
+        b.BackgroundColor3 = get() and Color3.fromRGB(24, 74, 48)
+                                      or Color3.fromRGB(30, 30, 34)
+    end
+    paint()
+    b.MouseButton1Click:Connect(function() set(not get()); paint() end)
+end
+
+mkCheck("Team check", 256, function() return CONFIG.TEAM_CHECK end,
+        function(v) CONFIG.TEAM_CHECK = v end)
+mkCheck("Wall check", 284, function() return CONFIG.WALL_CHECK end,
+        function(v) CONFIG.WALL_CHECK = v end)
+mkCheck("Círculo de FOV", 312, function() return CONFIG.SHOW_FOV end,
+        function(v) CONFIG.SHOW_FOV = v end)
+
+-- drag
+local dragging, dragStart, startPos
+panel.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+    or i.UserInputType == Enum.UserInputType.Touch then
+        dragging, dragStart, startPos = true, i.Position, panel.Position
+    end
+end)
+UserInputService.InputChanged:Connect(function(i)
+    if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+    or i.UserInputType == Enum.UserInputType.Touch) then
+        panel.Position = UDim2.fromOffset(
+            startPos.X.Offset + (i.Position.X - dragStart.X),
+            startPos.Y.Offset + (i.Position.Y - dragStart.Y))
+    end
+end)
+UserInputService.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1
+    or i.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+-- botón MENU (abre/cierra)
+local menuBtn = mkBtn(gui, "MENU", 64, 26, 24, 0)
+menuBtn.Position = UDim2.new(0, 24, 1, -46)
+menuBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+menuBtn.MouseButton1Click:Connect(function()
+    panel.Visible = not panel.Visible
+end)
+
+-- botón flotante móvil
+if CONFIG.MOBILE_BUTTON then
+    local mb = mkBtn(gui, "LOCK", 62, 62, 24, 24)
+    mb.BackgroundColor3 = Color3.fromRGB(52, 34, 34)
+    mb.TextSize = 13
+    mb.MouseButton1Click:Connect(function()
+        setEnabled(not enabled)
+        mb.BackgroundColor3 = enabled and Color3.fromRGB(24, 74, 48)
+                                       or Color3.fromRGB(52, 34, 34)
+    end)
+end
+
+-- teclas
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == CONFIG.KEY then
+        setEnabled(not enabled)
+    elseif input.KeyCode == CONFIG.PANEL_KEY then
+        panel.Visible = not panel.Visible
+    end
+end)
+
+local function unload()
+    unloaded = true
+    RunService:UnbindFromRenderStep("PrensadoCamlock")
+    circle:Remove()
+    gui:Destroy()
+    getgenv().PrensadoCamlock = nil
+end
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if not gp and input.KeyCode == CONFIG.UNLOAD_KEY then unload() end
+end)
+
+getgenv().PrensadoCamlock = {
+    Config = CONFIG,
+    Toggle = function() setEnabled(not enabled) end,
+    Relock = function() locked = nil; needRelock = true end,
+    GetTarget = function() return locked end,
+    Unload = unload,
+}
+
+refreshToggle()
+print("[Prensado] v2 cargado. Tecla: " .. CONFIG.KEY.Name)
